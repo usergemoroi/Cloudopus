@@ -471,4 +471,366 @@ async def view_item(c: CallbackQuery):
     await c.message.edit_media(InputMediaPhoto(media=IMG_SELECT, caption=info_text), reply_markup=kb.as_markup())
 
 # --- ПОКУПКА (ПО ID) ---
-@router.callback_query(F.data.startswith("bu
+@router.callback_query(F.data.startswith("buy_id_"))
+async def buy_by_id(c: CallbackQuery):
+    item_id = int(c.data.split("_")[2])
+    user_id = c.from_user.id
+    
+    async with aiosqlite.connect("shop2.db") as db:
+        async with db.execute("""
+            SELECT id, country, price, age, is_premium, prem_duration, content, file_id, filename, phone, is_session 
+            FROM goods WHERE id = ?
+        """, (item_id,)) as cur:
+            item = await cur.fetchone()
+        
+        if not item:
+            return await c.answer("Товар уже забрали!", show_alert=True)
+            
+        _, country, price, age, is_prem, prem_dur, content, file_id, filename, phone, is_session = item
+        
+        async with db.execute("SELECT balance FROM users WHERE id = ?", (user_id,)) as cur:
+            bal = (await cur.fetchone())[0]
+            
+        if bal < price:
+            return await c.answer("Недостаточно средств!", show_alert=True)
+            
+        await db.execute("UPDATE users SET balance = balance - ? WHERE id = ?", (price, user_id))
+        await db.execute("DELETE FROM goods WHERE id = ?", (item_id,))
+        
+        item_info = f"{country} | {phone} | {age}"
+        
+        await db.execute("""
+            INSERT INTO purchases 
+            (user_id, item_info, content, file_id, filename, phone, is_session, price) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (user_id, item_info, content, file_id, filename, phone, is_session, price))
+        
+        await db.commit()
+        
+        purchase_id = (await (await db.execute("SELECT last_insert_rowid()")).fetchone())[0]
+
+    await c.message.delete()
+    
+    if file_id:
+        try:
+            await c.message.answer_document(
+                file_id, 
+                caption=f"✅ <b>Покупка успешна!</b>\n📱 {phone}\n💵 -{price}$"
+            )
+            
+            kb = InlineKeyboardBuilder()
+            msg_info = f"📱 <b>Номер:</b> <code>{phone}</code>"
+
+            if is_session:
+                file_info = await c.bot.get_file(file_id)
+                local_filename = f"{purchase_id}_{filename}"
+                local_path = os.path.join(SESSIONS_DIR, local_filename)
+                await c.bot.download_file(file_info.file_path, local_path)
+                
+                kb.row(InlineKeyboardButton(text="🔐 ПОЛУЧИТЬ КОД ВХОДА", callback_data=f"getcode_{purchase_id}_{local_filename}"))
+                msg_info += "\n\n👇 <b>Вход в аккаунт:</b>\n1. Введите номер в Telegram.\n2. Нажмите кнопку ниже для получения кода."
+            
+            await c.message.answer(msg_info, reply_markup=kb.as_markup())
+            
+        except Exception as e:
+            await c.message.answer(f"✅ Куплено, но ошибка отправки файла: {e}")
+    else:
+        await c.message.answer(f"✅ <b>Успешно!</b>\n\nДанные: <code>{content}</code>")
+
+    # --- ВОТ ТУТ ПРАВИЛЬНЫЙ ЦИКЛ (внутри функции) ---
+    for admin in ADMIN_ID:
+        try:
+            await c.bot.send_message(admin, f"💰 <b>Продажа!</b>\nЮзер: {user_id}\nТовар: {phone} ({country})\nЦена: {price}$")
+        except Exception:
+            pass
+
+    await asyncio.sleep(1)
+    await c.message.answer("⭐ <b>Оцените сервис:</b>", reply_markup=review_stars_kb())
+
+# --- ПОЛУЧЕНИЕ КОДА (Telethon) ---
+@router.callback_query(F.data.startswith("getcode_"))
+async def get_login_code(c: CallbackQuery):
+    _, pid, fname = c.data.split("_", 2) 
+    path = os.path.join(SESSIONS_DIR, fname)
+    
+    if not os.path.exists(path):
+        return await c.answer("❌ Файл сессии не найден.", show_alert=True)
+        
+    await c.answer("⏳ Подключаюсь...")
+    result_text = await check_last_messages(path)
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔄 Обновить", callback_data=f"getcode_{pid}_{fname}"))
+    
+    try:
+        await c.message.edit_text(f"📱 <b>Аккаунт подключен</b>\n{result_text}", reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
+    except:
+        await c.message.answer(result_text, reply_markup=kb.as_markup())
+
+# --- ОТЗЫВЫ ---
+@router.callback_query(F.data.startswith("rate_"))
+async def review_rate_handler(c: CallbackQuery, state: FSMContext):
+    rating = c.data.split("_")[1]
+    await state.update_data(rating=rating)
+    await c.message.edit_text(f"Оценка: {rating}⭐\n✍️ <b>Напишите отзыв:</b>")
+    await state.set_state(ReviewStates.waiting_for_text)
+
+@router.message(ReviewStates.waiting_for_text)
+async def review_text_handler(m: Message, state: FSMContext):
+    data = await state.get_data()
+    rating = data.get('rating', '?')
+    
+    # Цикл должен быть С ОТСТУПОМ, чтобы быть частью функции
+    for admin in ADMIN_ID:
+        try:
+            await m.bot.send_message(admin, f"💬 <b>Отзыв!</b>\n👤: {m.from_user.full_name}\n⭐: {rating}\n📝: {m.text}")
+        except Exception:
+            pass
+
+    await state.clear()
+    await m.answer("✅ <b>Спасибо!</b>", reply_markup=main_kb())
+
+# --- ADMIN PANEL ---
+@router.message(Command("admin"))
+async def admin_panel(m: Message):
+    if m.from_user.id not in ADMIN_ID: 
+        return
+    await m.answer_photo(IMG_ADMIN, caption="🛠 <b>Админка</b>", reply_markup=admin_kb())
+
+# --- ПРОМОКОДЫ (ADMIN) ---
+@router.callback_query(F.data == "adm_create_promo")
+async def adm_promo_start(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("🎁 <b>Создание промокода</b>\n\nВведите данные в формате:\n<code>КОД СУММА КОЛИЧЕСТВО</code>\n\nПример: <code>SALE10 10 5</code>\n(Код SALE10, дает 10$, на 5 человек)")
+    await state.set_state(AdminStates.waiting_for_promo_data)
+
+@router.message(AdminStates.waiting_for_promo_data)
+async def adm_promo_save(m: Message, state: FSMContext):
+    try:
+        code, amount, limit = m.text.split()
+        amount = float(amount)
+        limit = int(limit)
+        
+        async with aiosqlite.connect("shop2.db") as db:
+            await db.execute("INSERT OR REPLACE INTO promocodes (code, amount, activations) VALUES (?, ?, ?)", (code, amount, limit))
+            await db.commit()
+            
+        await m.answer(f"✅ Промокод <code>{code}</code> на {amount}$ ({limit} шт.) создан!")
+    except ValueError:
+        await m.answer("❌ Ошибка формата! Введите: КОД СУММА КОЛИЧЕСТВО")
+    except Exception as e:
+        await m.answer(f"❌ Ошибка БД: {e}")
+        
+    await state.clear()
+
+# ================= НОВАЯ ЗАГРУЗКА ТОВАРА (WIZARD) =================
+
+# 1. Выбор страны
+@router.callback_query(F.data == "adm_upload_start")
+async def adm_up_1_country(c: CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    for code, name in FLAGS.items():
+        kb.row(InlineKeyboardButton(text=name, callback_data=f"upl_country_{code}"))
+    kb.row(InlineKeyboardButton(text="❌ Отмена", callback_data="to_main"))
+    
+    await c.message.edit_caption(caption="1️⃣ <b>Выберите страну аккаунта:</b>", reply_markup=kb.as_markup())
+    await state.set_state(UploadStates.waiting_for_country)
+
+# 2. Ввод цены
+@router.callback_query(F.data.startswith("upl_country_"))
+async def adm_up_2_price(c: CallbackQuery, state: FSMContext):
+    country = c.data.split("_")[2]
+    await state.update_data(country=country)
+    
+    await c.message.answer(f"🏳️ Страна: {country}\n\n2️⃣ <b>Введите цену в долларах</b> (например: 3.5 или 10):")
+    await state.set_state(UploadStates.waiting_for_price)
+
+# 3. Ввод отлеги
+@router.message(UploadStates.waiting_for_price)
+async def adm_up_3_age(m: Message, state: FSMContext):
+    try:
+        price = float(m.text.replace(",", "."))
+    except:
+        return await m.answer("❌ Введите число! (например 5)")
+    
+    await state.update_data(price=price)
+    await m.answer(f"💵 Цена: {price}$\n\n3️⃣ <b>Укажите отлегу:</b>\nНапример: '2 года', '6 месяцев', 'Новорег'.")
+    await state.set_state(UploadStates.waiting_for_age)
+
+# 4. Премиум?
+@router.message(UploadStates.waiting_for_age)
+async def adm_up_4_prem(m: Message, state: FSMContext):
+    await state.update_data(age=m.text)
+    
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="✅ Есть Premium", callback_data="upl_prem_yes"))
+    kb.row(InlineKeyboardButton(text="❌ Нет", callback_data="upl_prem_no"))
+    
+    await m.answer(f"⏳ Отлега: {m.text}\n\n4️⃣ <b>На аккаунте есть Premium?</b>", reply_markup=kb.as_markup())
+    await state.set_state(UploadStates.waiting_for_is_premium)
+
+# 5. Длительность Премиума (если есть) или сразу номер
+@router.callback_query(F.data.startswith("upl_prem_"))
+async def adm_up_5_duration(c: CallbackQuery, state: FSMContext):
+    choice = c.data.split("_")[2]
+    
+    if choice == "no":
+        await state.update_data(is_premium=0, prem_duration="-")
+        # Сразу просим номер
+        await c.message.answer("💎 Премиум: Нет\n\n5️⃣ <b>Введите номер телефона</b> (+123...):")
+        await state.set_state(UploadStates.waiting_for_phone)
+    else:
+        await state.update_data(is_premium=1)
+        await c.message.answer("💎 Премиум: Да\n\n✍️ <b>Напишите срок премиума:</b>\nНапример: '1 месяц', '6 месяцев'.")
+        await state.set_state(UploadStates.waiting_for_prem_duration)
+
+@router.message(UploadStates.waiting_for_prem_duration)
+async def adm_up_6_phone_after_prem(m: Message, state: FSMContext):
+    await state.update_data(prem_duration=m.text)
+    await m.answer(f"💎 Срок: {m.text}\n\n5️⃣ <b>Введите номер телефона</b> (+123...):")
+    await state.set_state(UploadStates.waiting_for_phone)
+
+# 6. Файл
+@router.message(UploadStates.waiting_for_phone)
+async def adm_up_7_file(m: Message, state: FSMContext):
+    await state.update_data(phone=m.text)
+    await m.answer(f"📱 Номер: {m.text}\n\n6️⃣ <b>Отправьте файл</b> (.session, .json и т.д.):")
+    await state.set_state(UploadStates.waiting_for_file)
+
+# 7. Финиш
+@router.message(UploadStates.waiting_for_file)
+async def adm_up_finish(m: Message, state: FSMContext):
+    if not m.document:
+        return await m.answer("❌ Жду файл документа!")
+
+    data = await state.get_data()
+    file_id = m.document.file_id
+    filename = m.document.file_name
+    is_session = 1 if filename.endswith('.session') else 0
+    
+    async with aiosqlite.connect("shop2.db") as db:
+        await db.execute("""
+            INSERT INTO goods (country, price, age, is_premium, prem_duration, content, file_id, filename, phone, is_session)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data['country'], 
+            data['price'], 
+            data['age'], 
+            data['is_premium'], 
+            data['prem_duration'], 
+            "Файл", 
+            file_id, 
+            filename, 
+            data['phone'], 
+            is_session
+        ))
+        await db.commit()
+    
+    info = (
+        f"✅ <b>Товар добавлен!</b>\n"
+        f"🏳️ {data['country']}\n"
+        f"💵 {data['price']}$\n"
+        f"📱 {data['phone']}\n"
+        f"⏳ {data['age']}\n"
+        f"💎 Prem: {'Да ('+data['prem_duration']+')' if data['is_premium'] else 'Нет'}"
+    )
+    
+    await m.answer(info, reply_markup=admin_kb())
+    await state.clear()
+
+# --- OTHER ADMIN COMMANDS ---
+@router.callback_query(F.data == "adm_stats")
+async def adm_stats(c: CallbackQuery):
+    async with aiosqlite.connect("shop2.db") as db:
+        async with db.execute("SELECT COUNT(*), SUM(balance) FROM users") as cur:
+            count, total = await cur.fetchone()
+        async with db.execute("SELECT COUNT(*) FROM goods") as cur:
+            goods_count = (await cur.fetchone())[0]
+            
+    await c.message.answer(f"📊 <b>Статистика:</b>\n👥 Юзеров: {count}\n💰 Общий баланс: {total or 0:.2f}$\n📦 Товаров в наличии: {goods_count}")
+
+@router.callback_query(F.data == "adm_give_bal")
+async def adm_give_start(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("Введите ID пользователя:")
+    await state.set_state(AdminStates.waiting_for_id_balance)
+
+@router.message(AdminStates.waiting_for_id_balance)
+async def adm_id_bal(m: Message, state: FSMContext):
+    await state.update_data(tid=m.text)
+    await m.answer("Введите сумму для выдачи:")
+    await state.set_state(AdminStates.waiting_for_amount)
+
+@router.message(AdminStates.waiting_for_amount)
+async def adm_amt_bal(m: Message, state: FSMContext):
+    d = await state.get_data()
+    try:
+        async with aiosqlite.connect("shop2.db") as db:
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (float(m.text), int(d['tid'])))
+            await db.commit()
+        await m.answer("✅ Баланс выдан!")
+        await m.bot.send_message(d['tid'], f"💰 Вам начислено {m.text}$")
+    except: await m.answer("❌ Ошибка (возможно нет такого ID).")
+    await state.clear()
+
+@router.callback_query(F.data == "adm_ban")
+async def adm_ban_start(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("Введите ID пользователя для Бана/Разбана:")
+    await state.set_state(AdminStates.waiting_for_ban_id)
+
+@router.message(AdminStates.waiting_for_ban_id)
+async def adm_ban_proc(m: Message, state: FSMContext):
+    async with aiosqlite.connect("shop2.db") as db:
+        async with db.execute("SELECT banned FROM users WHERE id = ?", (m.text,)) as cur:
+            res = await cur.fetchone()
+            if res:
+                new = 0 if res[0] else 1
+                await db.execute("UPDATE users SET banned = ? WHERE id = ?", (new, m.text))
+                await db.commit()
+                await m.answer(f"✅ Новый статус: {'🚫 БАН' if new else '🟢 АКТИВЕН'}")
+            else: await m.answer("Нет такого юзера.")
+    await state.clear()
+
+@router.callback_query(F.data == "adm_broadcast")
+async def adm_br_start(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("Отправьте сообщение (текст/фото) для рассылки всем:")
+    await state.set_state(AdminStates.waiting_for_broadcast)
+
+@router.message(AdminStates.waiting_for_broadcast)
+async def adm_br_proc(m: Message, state: FSMContext):
+    async with aiosqlite.connect("shop2.db") as db:
+        async with db.execute("SELECT id FROM users") as cur:
+            rows = await cur.fetchall()
+    count = 0
+    for r in rows:
+        try:
+            await m.copy_to(r[0])
+            count += 1
+        except: pass
+    await m.answer(f"✅ Рассылка завершена. Получили: {count} чел.")
+    await state.clear()
+
+@router.pre_checkout_query()
+async def pre_ch(q: PreCheckoutQuery): await q.answer(ok=True)
+
+@router.message(F.successful_payment)
+async def success_p(m: Message):
+    payload = m.successful_payment.invoice_payload
+    if "topup_stars" in payload:
+        amt = float(payload.split("_")[2])
+        async with aiosqlite.connect("shop2.db") as db:
+            await db.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amt, m.from_user.id))
+            await db.commit()
+        await m.answer(f"✅ Зачислено {amt}$")
+
+# --- MAIN ---
+async def main():
+    await init_db()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(main())
+
