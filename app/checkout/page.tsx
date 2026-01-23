@@ -68,7 +68,7 @@ export default function CheckoutPage() {
             </p>
             <div className="p-4 bg-muted rounded-lg">
               <p className="text-sm">
-                <strong>Тестовый режим:</strong> Нажмите "Оплатить заказ" для
+                <strong>Тестовый режим:</strong> Нажмите &quot;Оплатить заказ&quot; для
                 создания тестового заказа. Реальная оплата не производится.
               </p>
             </div>
